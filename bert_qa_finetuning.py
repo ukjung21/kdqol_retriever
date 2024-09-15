@@ -12,7 +12,7 @@ import collections
 import numpy as np
 
 # 1. 데이터셋 로드
-dataset = load_from_disk('../data/quest_qa_dataset')
+dataset = load_from_disk('./data/quest_qa_dataset')
 
 # 2. 토크나이저 및 모델 로드
 model_checkpoint = "emilyalsentzer/Bio_ClinicalBERT"
