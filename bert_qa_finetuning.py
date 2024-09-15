@@ -1,5 +1,12 @@
+import os
 from datasets import load_from_disk, load_metric
-from transformers import AutoTokenizer, AutoModelForQuestionAnswering, TrainingArguments, Trainer, default_data_collator
+from transformers import (
+    AutoTokenizer,
+    AutoModelForQuestionAnswering,
+    TrainingArguments,
+    Trainer,
+    default_data_collator,
+)
 import torch
 import collections
 import numpy as np
@@ -61,14 +68,14 @@ def prepare_train_features(examples):
             context_end = len(sequence_ids) - 1 - sequence_ids[::-1].index(1)
             
             # 토큰의 offset 가져오기
-            offsets = offset_mapping[context_start:context_end]
+            offsets = offsets[context_start:context_end+1]
 
             # 정답의 토큰 시작과 끝 인덱스 초기화
             start_position = end_position = None
             for idx, (start_offset, end_offset) in enumerate(offsets):
-                if start_offset <= start_char and end_offset > start_char:
+                if start_offset <= start_char < end_offset:
                     start_position = idx + context_start
-                if start_offset < end_char and end_offset >= end_char:
+                if start_offset < end_char <= end_offset:
                     end_position = idx + context_start
                     break
 
@@ -87,6 +94,7 @@ tokenized_train_dataset = dataset['train'].map(
     prepare_train_features,
     batched=True,
     remove_columns=dataset['train'].column_names,
+    num_proc=4  # 프로세스 수 지정 (옵션)
 )
 
 # 평가 데이터셋 전처리
@@ -126,6 +134,7 @@ tokenized_eval_dataset = dataset['test'].map(
     prepare_test_features,
     batched=True,
     remove_columns=dataset['test'].column_names,
+    num_proc=4  # 프로세스 수 지정 (옵션)
 )
 
 # 4. 평가 메트릭 설정
@@ -135,11 +144,11 @@ def compute_metrics(p):
     predictions, references = postprocess_qa_predictions(dataset['test'], tokenized_eval_dataset, p)
     return metric.compute(predictions=predictions, references=references)
 
-def postprocess_qa_predictions(examples, features, predictions, n_best_size=20, max_answer_length=30):
-    # 모든 예측을 CPU로 이동
-    all_start_logits, all_end_logits = predictions
-    all_start_logits = all_start_logits.cpu().numpy()
-    all_end_logits = all_end_logits.cpu().numpy()
+def postprocess_qa_predictions(examples, features, raw_predictions, n_best_size=20, max_answer_length=30):
+    # 모든 예측을 numpy 배열로 변환
+    all_start_logits, all_end_logits = raw_predictions
+    all_start_logits = all_start_logits.numpy()
+    all_end_logits = all_end_logits.numpy()
 
     # 특징을 예제별로 매핑
     example_id_to_index = {k: i for i, k in enumerate(examples["id"])}
@@ -162,11 +171,12 @@ def postprocess_qa_predictions(examples, features, predictions, n_best_size=20, 
             start_logits = all_start_logits[feature_index]
             end_logits = all_end_logits[feature_index]
             offset_mapping = features["offset_mapping"][feature_index]
-            # cls_index = features["input_ids"][feature_index].index(tokenizer.cls_token_id)
 
-            # 최대 확률의 start와 end logits 선택
-            for start_index in np.argsort(start_logits)[-1: -n_best_size -1: -1]:
-                for end_index in np.argsort(end_logits)[-1: -n_best_size -1: -1]:
+            # 각 위치에서 가능한 최고 로그잇 선택
+            start_indexes = np.argsort(start_logits)[-1 : -n_best_size - 1 : -1]
+            end_indexes = np.argsort(end_logits)[-1 : -n_best_size - 1 : -1]
+            for start_index in start_indexes:
+                for end_index in end_indexes:
                     # 유효한 범위인지 확인
                     if start_index >= len(offset_mapping) or end_index >= len(offset_mapping):
                         continue
@@ -174,20 +184,22 @@ def postprocess_qa_predictions(examples, features, predictions, n_best_size=20, 
                         continue
                     if end_index < start_index or end_index - start_index + 1 > max_answer_length:
                         continue
+
+                    start_char = offset_mapping[start_index][0]
+                    end_char = offset_mapping[end_index][1]
+                    predicted_answer = context[start_char:end_char]
                     prelim_predictions.append({
-                        "offsets": (offset_mapping[start_index][0], offset_mapping[end_index][1]),
+                        "text": predicted_answer,
                         "score": start_logits[start_index] + end_logits[end_index],
                     })
         # 최고의 예측 선택
         if prelim_predictions:
             best_prediction = max(prelim_predictions, key=lambda x: x["score"])
-            start_char = best_prediction["offsets"][0]
-            end_char = best_prediction["offsets"][1]
-            predicted_answer = context[start_char: end_char]
+            final_answer = best_prediction["text"]
         else:
-            predicted_answer = ""
+            final_answer = ""
 
-        predictions[example_id] = predicted_answer
+        predictions[example_id] = final_answer
 
     # references 생성
     references = [{"id": ex["id"], "answers": ex["answers"]} for ex in examples]
@@ -199,10 +211,14 @@ training_args = TrainingArguments(
     evaluation_strategy="epoch",
     save_strategy="epoch",
     learning_rate=3e-5,
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
+    per_device_train_batch_size=4,  # 각 GPU당 배치 크기 조정
+    per_device_eval_batch_size=4,
     num_train_epochs=3,
     weight_decay=0.01,
+    fp16=True,  # 혼합 정밀도 사용
+    dataloader_num_workers=4,
+    logging_dir='./logs',
+    report_to="none",  # 보고 대상 ("none", "wandb", "tensorboard" 등)
 )
 
 # 6. Trainer 생성
@@ -217,7 +233,8 @@ trainer = Trainer(
 )
 
 # 7. 학습 시작
-trainer.train()
+if __name__ == "__main__":
+    trainer.train()
 
-# 8. 평가
-trainer.evaluate()
+    # 8. 평가
+    trainer.evaluate()
